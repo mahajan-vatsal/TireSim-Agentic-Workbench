@@ -1,0 +1,6 @@
+pydantic
+jinja2
+typer
+langgraph
+matplotlib
+pandas

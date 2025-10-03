@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.env
+
+# OS
+.DS_Store
+
+# Project artifacts
+artifacts/
+taw.db
