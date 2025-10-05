@@ -1,0 +1,14 @@
+# Deck: Vertical Stiffness Sweep (Mock)
+tire:
+  size: {{ tire_size }}
+  rim: {{ rim }}
+  inflation_bar: {{ inflation_bar }}
+mesh:
+  target_element_size_mm: {{ mesh_mm }}
+analysis:
+  type: static
+  boundary_conditions:
+    - constrain: rim_nodes
+    - ground: rigid_plane
+# Load sweep in Newtons (used by the mock FEM runner)
+load_sweep: [{{ load_sweep | join(', ') }}]
