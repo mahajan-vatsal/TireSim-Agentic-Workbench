@@ -7,3 +7,4 @@ pandas
 python-dotenv
 langgraph-cli
 langgraph-api
+openai
