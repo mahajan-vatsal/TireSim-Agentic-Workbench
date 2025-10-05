@@ -84,7 +84,7 @@ def executor(state: State) -> State:
     tid = state["task_id"]
 
     # 1) RAG
-    hits = tools.rag_retrieve(spec.objective, k=3, method="hybrid")
+    hits = tools.rag_retrieve(spec.objective, k=3, method="hybrid_v2")
 
 # Normalize just in case (safety belt)
     import json as _json

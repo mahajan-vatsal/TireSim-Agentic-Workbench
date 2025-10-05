@@ -61,7 +61,7 @@ def plots_plot_curve(csv_path: str, output_dir: str | None = None, filename: str
 
 # ---------- RAG ----------
 @mcp.tool(name="rag.retrieve")
-def rag_retrieve(q: str, k: int = 3, method: str = "hybrid") -> list[dict[str, Any]]:
+def rag_retrieve(q: str, k: int = 3, method: str = "hybrid_v2") -> list[dict[str, Any]]:
     """Retrieve top-k docs with citations."""
     hits = rag_local(q, k=k, method=method)
     return [{"text": h.text, "source_id": h.source_id, "score": float(h.score), "title": h.title} for h in hits]

@@ -4,6 +4,7 @@ typer
 langgraph
 matplotlib
 pandas
+Numpy
 python-dotenv
 langgraph-cli
 langgraph-api
