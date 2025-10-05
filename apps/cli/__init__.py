@@ -1,3 +1,4 @@
+"""
 # apps/cli/__init__.py
 from __future__ import annotations
 import typer
@@ -11,7 +12,7 @@ def _build_app() -> typer.Typer:
         db_path: str = typer.Option("taw.db", "--db-path", help="SQLite DB path"),
         schema_path: str = typer.Option("datastore/schema.sql", "--schema-path", help="SQL schema path"),
     ):
-        """Initialize the SQLite database using the provided schema."""
+        Initialize the SQLite database using the provided schema.
         store = Store(db_path=db_path)
         store.init(schema_path=schema_path)
         typer.echo(f"Initialized DB at '{db_path}' using schema '{schema_path}'.")
@@ -20,3 +21,4 @@ def _build_app() -> typer.Typer:
 
 # The Typer group we will invoke from __main__
 app = _build_app()
+"""
