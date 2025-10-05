@@ -33,4 +33,5 @@ class RunResult(BaseModel):
     task_id: Optional[int] = None
     validation: Optional[Dict[str, Any]] = None
     run_card_path: Optional[str] = None
-    summary: Optional[str] = None  # <— new
+    summary: Optional[str] = None
+    tooling_mode: Optional[str] = None
