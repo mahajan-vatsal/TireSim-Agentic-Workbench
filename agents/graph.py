@@ -1,0 +1,191 @@
+# taw/agents/graph.py
+from __future__ import annotations
+from typing import Dict, Any, List
+import pandas as pd
+import numpy as np
+
+from langgraph.graph import StateGraph, END
+
+from agents.models import TaskSpec, AgentPlan, PlanStep, RunResult, RunArtifact
+from tools.datastore import Store
+from tools import templates, fem_mock, plots
+from rag.retriever import retrieve as rag_retrieve
+from validation.run_card import validate_and_write_run_card
+
+# ---- State type ----
+class State(dict):
+    """
+    JSON-serializable state for LangGraph Studio.
+    Do NOT store live objects (e.g., DB connections) here.
+    Keys used:
+      - spec: TaskSpec (Pydantic is JSON-serializable)
+      - task_id: int
+      - db_path: str
+      - artifacts_dir: str
+      - result: RunResult (Pydantic)
+    """
+
+# ---- Helpers ----
+def _ensure_defaults(state: State):
+    state.setdefault("db_path", "taw.db")
+    state.setdefault("artifacts_dir", "artifacts")
+
+def _get_store(state: State) -> Store:
+    """Create a fresh Store each time (no live objects in state)."""
+    _ensure_defaults(state)
+    store = Store(db_path=state["db_path"], artifacts_dir=state["artifacts_dir"])
+    # idempotent
+    store.init("datastore/schema.sql")
+    store.ensure_artifacts_dir()
+    return store
+
+def _ensure_spec(state: State) -> TaskSpec:
+    if isinstance(state.get("spec"), TaskSpec):
+        return state["spec"]
+    # Accept simple dicts or loose fields from Studio input
+    prompt = state.get("prompt") or state.get("objective") or "Vertical load sweep"
+    objective = state.get("objective") or prompt
+    params = state.get("params") or {
+        "tire_size": "315/80 R22.5",
+        "rim": "9.00x22.5",
+        "inflation_bar": 8.0,
+        "mesh_mm": 8.0,
+        "load_sweep": [0, 10000, 20000, 30000, 40000, 50000],
+    }
+    if isinstance(state.get("spec"), dict):
+        # if Studio sent spec as plain dict
+        spec_dict = {"prompt": prompt, "objective": objective, "params": params}
+        spec_dict.update(state["spec"])
+        spec = TaskSpec(**spec_dict)
+    else:
+        spec = TaskSpec(prompt=prompt, objective=objective, params=params)
+    state["spec"] = spec
+    return spec
+
+def _ensure_task_id(state: State, store: Store):
+    """Create a task row if missing (safe to call in any node)."""
+    if "task_id" not in state:
+        spec: TaskSpec = state["spec"]
+        state["task_id"] = store.new_task(
+            prompt=spec.prompt, objective=spec.objective, params=spec.params
+        )
+
+def _estimate_stiffness(csv_path: str) -> float:
+    df = pd.read_csv(csv_path)
+    if len(df) < 2:
+        return 0.0
+    x = df["deflection_m"].values
+    y = df["load_N"].values
+    a, _ = np.polyfit(x, y, deg=1)  # slope ≈ stiffness N/m
+    return float(max(a, 0.0))
+
+# ---- Nodes ----
+def planner(state: State) -> State:
+    # Make sure we have serializable defaults, spec, and a task row.
+    _ensure_defaults(state)
+    spec = _ensure_spec(state)
+    store = _get_store(state)
+    _ensure_task_id(state, store)
+
+    # Fixed MVP plan
+    plan = AgentPlan(steps=[
+        PlanStep(name="retrieve", tool="rag.retrieve", inputs={"q": spec.objective, "k": 3}),
+        PlanStep(name="fill", tool="templates.fill", inputs={"name": "vertical_stiffness.j2", "params": spec.params}),
+        PlanStep(name="run", tool="fem.run", inputs={}),
+        PlanStep(name="plot", tool="plots.plot", inputs={}),
+        PlanStep(name="summarize", tool="summarize", inputs={}),
+        PlanStep(name="validate", tool="validate", inputs={}),
+    ])
+    state["plan"] = plan
+    return state
+
+def executor(state: State) -> State:
+    # Recreate store; never rely on a live object in state
+    store = _get_store(state)
+    spec: TaskSpec = _ensure_spec(state)
+    _ensure_task_id(state, store)
+    tid: int = state["task_id"]
+
+    # 1) Retrieve (RAG)
+    hits = rag_retrieve(spec.objective, k=3, method="hybrid")
+    citations = [h.source_id for h in hits]
+    store.log_run(tid, "retrieve", "rag.retrieve",
+                  {"q": spec.objective, "k": 3},
+                  {"citations": citations})
+
+    # 2) Fill template
+    deck = templates.fill_template("vertical_stiffness.j2", spec.params)
+    store.log_run(tid, "fill", "templates.fill",
+                  {"template": "vertical_stiffness.j2", "params": spec.params},
+                  {"deck_len": len(deck)})
+
+    # 3) Run FEM (mock)
+    csv_path, log_path, deck_path = fem_mock.run_case(deck, output_dir=store.artifacts_dir)
+    store.log_run(tid, "run", "fem.run_mock",
+                  {"deck_path": deck_path},
+                  {"csv": csv_path, "log": log_path})
+
+    # 4) Plot
+    png_path = plots.plot_curve(csv_path, output_dir=store.artifacts_dir, filename="curve.png")
+    store.log_run(tid, "plot", "plots.plot_curve",
+                  {"csv": csv_path},
+                  {"png": png_path})
+
+    # 5) Summarize / metrics
+    k_est = _estimate_stiffness(csv_path)
+    metrics = {"stiffness_est_N_per_m": k_est}
+    store.log_run(tid, "summarize", "metrics.estimate",
+                  {"csv": csv_path},
+                  {"metrics": metrics})
+
+    # 6) Validate + Run Card
+    artifacts = [
+        {"path": deck_path, "kind": "deck"},
+        {"path": log_path, "kind": "log"},
+        {"path": csv_path, "kind": "csv"},
+        {"path": png_path, "kind": "plot"},
+    ]
+    validation, run_card_path = validate_and_write_run_card(
+        task_id=tid,
+        artifacts_dir=store.artifacts_dir,
+        prompt=spec.prompt,
+        objective=spec.objective,
+        params=spec.params,
+        citations=citations,
+        metrics=metrics,
+        artifacts=artifacts
+    )
+    store.log_run(
+        tid, "validate", "validation.run_card",
+        {"csv": csv_path, "citations": citations},
+        {"status": validation.status, "fail_reasons": validation.fail_reasons, "run_card": run_card_path}
+    )
+
+    # Final result back into state (serializable)
+    result = RunResult(
+        metrics=metrics,
+        artifacts=[RunArtifact(**a) for a in artifacts],
+        citations=citations,
+        task_id=tid,
+        validation={
+            "status": validation.status,
+            "loads_strictly_increasing": validation.loads_strictly_increasing,
+            "deflection_nonnegative": validation.deflection_nonnegative,
+            "has_citation": validation.has_citation,
+            "num_points": validation.num_points,
+        },
+        run_card_path=run_card_path
+    )
+    state["result"] = result
+    return state
+
+def build_graph():
+    g = StateGraph(State)
+    g.add_node("planner", planner)
+    g.add_node("executor", executor)
+    g.set_entry_point("planner")
+    g.add_edge("planner", "executor")
+    g.add_edge("executor", END)
+    return g.compile()
+
+graph = build_graph()
