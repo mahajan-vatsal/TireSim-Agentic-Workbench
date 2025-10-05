@@ -31,6 +31,6 @@ class RunResult(BaseModel):
     artifacts: List[RunArtifact] = Field(default_factory=list)
     citations: List[str] = Field(default_factory=list)
     task_id: Optional[int] = None
-    # Phase F additions:
     validation: Optional[Dict[str, Any]] = None
     run_card_path: Optional[str] = None
+    summary: Optional[str] = None  # <— new

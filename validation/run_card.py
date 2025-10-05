@@ -2,7 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import datetime as dt
 import pandas as pd
 
@@ -20,7 +20,7 @@ class ValidationResult:
     fail_reasons: List[str]
 
 def _strictly_increasing(values) -> bool:
-    if len(values) < 2: 
+    if len(values) < 2:
         return False
     return all(values[i] < values[i+1] for i in range(len(values)-1))
 
@@ -30,19 +30,15 @@ def run_validation(csv_path: str, citations: List[str]) -> ValidationResult:
     defs  = df["deflection_m"].tolist()
 
     reasons: List[str] = []
-
     inc = _strictly_increasing(loads)
     if not inc:
         reasons.append("Loads are not strictly increasing.")
-
     nonneg = all(d >= 0 for d in defs)
     if not nonneg:
         reasons.append("Deflection contains negative values.")
-
     has_cit = len(citations) > 0
     if not has_cit:
         reasons.append("No citations present.")
-
     status = "PASS" if (inc and nonneg and has_cit) else "FAIL"
     return ValidationResult(
         loads_strictly_increasing=inc,
@@ -67,10 +63,8 @@ def write_run_card(*,
                    citations: List[str],
                    metrics: Dict[str, float],
                    artifacts: List[Dict[str, Any]],
-                   validation: ValidationResult) -> str:
-    """
-    Create Markdown run card and return its path.
-    """
+                   validation: ValidationResult,
+                   summary: Optional[str] = None) -> str:
     outdir = Path(artifacts_dir); outdir.mkdir(parents=True, exist_ok=True)
     out_path = outdir / f"run_card_{task_id}.md"
 
@@ -99,6 +93,12 @@ def write_run_card(*,
     md.append("- **Params:**")
     for k, v in params.items():
         md.append(f"  - {k}: {v}")
+
+    if summary:
+        md.append("")
+        md.append("## Summary")
+        md.append(summary)
+
     md.append("")
     md.append("## Citations")
     if citations:
@@ -106,14 +106,17 @@ def write_run_card(*,
             md.append(f"- {c}")
     else:
         md.append("- (none)")
+
     md.append("")
     md.append("## Metrics")
     mm = _fmt_metrics(metrics)
     md.extend(mm if mm else ["- (none)"])
+
     md.append("")
     md.append("## Artifacts")
     aa = _fmt_artifacts(artifacts)
     md.extend(aa if aa else ["- (none)"])
+
     md.append("")
     md.append("## Validation")
     md.append(f"- **Loads strictly increasing**: {validation.loads_strictly_increasing}")
@@ -141,11 +144,8 @@ def validate_and_write_run_card(*,
                                 params: Dict[str, Any],
                                 citations: List[str],
                                 metrics: Dict[str, float],
-                                artifacts: List[Dict[str, Any]]) -> Tuple[ValidationResult, str]:
-    """
-    High-level helper: run validation on CSV, then write run card.
-    Expects a CSV artifact with kind=='csv'.
-    """
+                                artifacts: List[Dict[str, Any]],
+                                summary: Optional[str] = None):
     csv_path = None
     for a in artifacts:
         if a.get("kind") == "csv":
@@ -165,6 +165,7 @@ def validate_and_write_run_card(*,
         citations=citations,
         metrics=metrics,
         artifacts=artifacts,
-        validation=validation
+        validation=validation,
+        summary=summary
     )
     return validation, run_card_path
