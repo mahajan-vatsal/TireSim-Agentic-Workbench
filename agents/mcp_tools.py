@@ -19,6 +19,9 @@ from tools import plots as plots_local
 from tools.datastore import Store
 from rag.retriever import retrieve as rag_local
 
+REPO_ROOT = Path(__file__).resolve().parents[2]  # .../TireSim-Agentic-Workbench
+DEFAULT_MCP_CMD = f"{sys.executable} -u {(REPO_ROOT / 'tools_mcp' / 'multi_tool_server.py').as_posix()}"
+
 
 # -------------------------------
 # Shared helpers
@@ -194,7 +197,7 @@ class MCPTools:
     def __init__(self, db_path: str, artifacts_dir: str, server_cmd: str | None = None):
         self.db_path = db_path
         self.artifacts_dir = artifacts_dir
-        self.server_cmd = server_cmd or os.getenv("MCP_SERVER_CMD", "python -m tools_mcp.multi_tool_server")
+        self.server_cmd = server_cmd or os.getenv("MCP_SERVER_CMD", DEFAULT_MCP_CMD)
         self.mode = "mcp (stdio, per-call)"
 
     async def _acall(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
@@ -206,21 +209,24 @@ class MCPTools:
         from mcp.client.stdio import stdio_client
 
         parts = shlex.split(self.server_cmd)
-        if len(parts) == 1:
-            args = [sys.executable, "-m", "tools_mcp.multi_tool_server"]
-        else:
-            args = parts
+        args = parts  # trust explicit or our absolute default
 
-        # Inject defaults for datastore tools
+# Ensure child can import top-level packages (tools, rag, tools_mcp)
+        env = dict(os.environ)
+        sep = os.pathsep
+        env["PYTHONPATH"] = (
+            f"{REPO_ROOT.as_posix()}{sep}{env.get('PYTHONPATH','')}".rstrip(sep)
+        )
+
+# Inject defaults for datastore tools
         if tool_name.startswith("datastore."):
             arguments = {"db_path": self.db_path, "artifacts_dir": self.artifacts_dir, **arguments}
 
         async with AsyncExitStack() as stack:
-            server_params = StdioServerParameters(command=args[0], args=args[1:], env=None)
+            server_params = StdioServerParameters(command=args[0], args=args[1:], env=env)
             read_stream, write_stream = await stack.enter_async_context(stdio_client(server_params))
             session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
             await session.initialize()
-
             result = await session.call_tool(tool_name, arguments)
 
             # 1) Prefer structured content (dict/list)

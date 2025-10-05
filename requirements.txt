@@ -12,3 +12,7 @@ openai
 mcp>=0.1.0
 faiss-cpu 
 sentence-transformers
+fastapi
+uvicorn
+streamlit 
+requests

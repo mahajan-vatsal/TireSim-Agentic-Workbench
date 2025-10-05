@@ -11,6 +11,9 @@ from tools import fem_mock as fem_local
 from tools import plots as plots_local
 from tools.datastore import Store
 from rag.retriever import retrieve as rag_local
+import sys, pathlib
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 
 def _store(db_path: str, artifacts_dir: str) -> Store:
