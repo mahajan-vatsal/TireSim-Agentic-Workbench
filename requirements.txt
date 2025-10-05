@@ -8,3 +8,6 @@ python-dotenv
 langgraph-cli
 langgraph-api
 openai
+mcp>=0.1.0
+faiss-cpu 
+sentence-transformers
