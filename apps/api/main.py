@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from agents.graph import graph
 from agents.models import TaskSpec
 from rag.embeddings import get_backend, build_faiss, INDEX_DIR, BASE_DIR  # for /ingest
+from agents.mcp_tools import get_tools
 
 # --------- Config (env-overridable) ----------
 DB_PATH = os.getenv("DB_PATH", "taw.db")
@@ -86,6 +87,67 @@ def _rel_artifact_url(abs_path: str) -> Optional[str]:
         return f"/artifacts/{rel.as_posix()}"
     except Exception:
         return None
+    
+def _plan_run_procedural(state: dict) -> dict:
+    """
+    Lightweight replacement for graph.invoke(state).
+    Calls: ds_new_task -> templates_fill -> fem_run -> plots_plot_curve -> write_metric(s)
+    and returns a dict with the same shape your API expects.
+    """
+    tools = get_tools(db_path=state["db_path"], artifacts_dir=state["artifacts_dir"])
+
+    # 1) task row
+    task_id = tools.ds_new_task(
+        prompt=state["prompt"], objective=state["objective"], params=state["params"]
+    )
+
+    # 2) deck from template (pick a sensible default template name you already have)
+    template_name = "vertical_stiffness.j2"  # adjust to your actual template key
+    deck_text = tools.templates_fill(template_name, state["params"])
+
+    tools.ds_log_run(task_id, step="template", tool="templates.fill", 
+                     inputs={"template": template_name, "params": state["params"]},
+                     outputs={"deck_len": len(deck_text)}, status="ok")
+
+    # 3) FEM (mock) run
+    fem_out = tools.fem_run(deck_text)
+    tools.ds_log_run(task_id, step="run", tool="fem.run", 
+                     inputs={"deck_preview": deck_text[:200]},
+                     outputs=fem_out, status="ok")
+
+    # 4) Plot
+    plot_out = tools.plots_plot_curve(fem_out["csv"], filename=f"curve_task_{task_id}.png")
+    tools.ds_log_run(task_id, step="plot", tool="plots.plot_curve", 
+                     inputs={"csv": fem_out["csv"]},
+                     outputs=plot_out, status="ok")
+
+    # 5) (Optional) simple validation + metrics
+    #    You can compute something from the CSV later; for now stub a metric.
+    tools.ds_write_metric(task_id, "status_ok", 1.0)
+
+    # 6) Build response compatible with PlanRunResponse
+    artifacts = {
+        "csv": fem_out.get("csv"),
+        "log": fem_out.get("log"),
+        "deck": fem_out.get("deck"),
+        "plot": plot_out.get("png"),
+    }
+    # Optional: write a run-card file if your UI expects it
+    run_card_path = os.path.join(state["artifacts_dir"], f"run_card_{task_id}.md")
+    with open(run_card_path, "w", encoding="utf-8") as f:
+        f.write(f"# Run Card {task_id}\n\n- Objective: {state['objective']}\n- Template: {template_name}\n")
+
+    return {
+        "result": type("R", (), {  # quick shim to mimic your previous .result object
+            "task_id": task_id,
+            "citations": [],
+            "metrics": {"status_ok": 1.0},
+            "validation": {},
+            "run_card_path": run_card_path,
+            "artifacts": [{"kind": k, "path": v} for k, v in artifacts.items() if v],
+            "summary": f"Completed: {state['objective']}",
+        })()
+    }
 
 def _fetch_task_from_db(task_id: int) -> Dict[str, Any]:
     """
@@ -249,47 +311,49 @@ def ingest(req: IngestRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+USE_GRAPH = os.getenv("USE_GRAPH", "0").lower() in {"1","true","yes","on"}
+
 @app.post("/plan-run", response_model=PlanRunResponse)
 def plan_run(req: PlanRunRequest):
     prompt = req.prompt or req.objective
-
-    # Build input state for the LangGraph (Studio-safe)
     state = {
         "prompt": prompt,
         "objective": req.objective,
         "params": req.params,
         "db_path": DB_PATH,
         "artifacts_dir": ARTIFACTS_DIR,
-        # Note: retriever mode is chosen inside MCP server or graph; we keep it as param if you wire it later.
         "retrieval_method": req.retrieval_method,
     }
 
-    out = graph.invoke(state)
+    if USE_GRAPH:
+        # original behavior
+        out = graph.invoke(state)
+    else:
+        # graph bypass
+        out = _plan_run_procedural(state)
+
     res = out.get("result")
     if not res:
-        raise HTTPException(status_code=500, detail="Graph returned no result")
+        raise HTTPException(status_code=500, detail="Pipeline returned no result")
 
-    # Build URLs for artifacts we know (plot, csv, log, run card)
-    artifact_urls: Dict[str, str] = {}
-    for a in res.artifacts:
-        url = _rel_artifact_url(a.path)
-        if not url:
-            continue
-        # map by kind if recognizable
-        if a.kind in ("plot", "csv", "log", "deck"):
-            artifact_urls[a.kind] = url
-
-    run_card_url = _rel_artifact_url(res.run_card_path) if res.run_card_path else None
+    # Build URLs as you already do
+    artifact_urls = {}
+    for a in getattr(res, "artifacts", []):
+        url = _rel_artifact_url(a["path"])
+        if url:
+            if a["kind"] in ("plot", "csv", "log", "deck"):
+                artifact_urls[a["kind"]] = url
+    run_card_url = _rel_artifact_url(getattr(res, "run_card_path", None)) if getattr(res, "run_card_path", None) else None
 
     return PlanRunResponse(
         task_id=res.task_id,
-        citations=list(res.citations or []),
-        metrics=dict(res.metrics or {}),
-        validation=dict(res.validation or {}),
-        run_card_path=res.run_card_path,
+        citations=list(getattr(res, "citations", []) or []),
+        metrics=dict(getattr(res, "metrics", {}) or {}),
+        validation=dict(getattr(res, "validation", {}) or {}),
+        run_card_path=getattr(res, "run_card_path", None),
         run_card_url=run_card_url,
         artifact_urls=artifact_urls,
-        summary=res.summary,
+        summary=getattr(res, "summary", None),
     )
 
 @app.get("/tasks/{task_id}")

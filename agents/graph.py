@@ -2,6 +2,8 @@
 from __future__ import annotations
 from typing import Dict, Any, List
 import pandas as pd, numpy as np
+from pathlib import Path
+
 from langgraph.graph import StateGraph, END
 
 from agents.models import TaskSpec, AgentPlan, PlanStep, RunResult, RunArtifact
@@ -9,7 +11,25 @@ from agents.mcp_tools import get_tools
 from validation.run_card import validate_and_write_run_card
 from agents.nodes.llm import plan_with_llm, summarize_with_citations
 
-class State(dict): ...
+# -----------------------
+# State & helpers
+# -----------------------
+class State(dict):
+    """
+    Shared state passed between nodes.
+    Keys that appear after the pipeline:
+      - task_id: int
+      - citations: List[str]
+      - deck_text: str
+      - fem_csv / fem_log / fem_deck: str
+      - plot_png: str
+      - metrics: Dict[str, float]
+      - validation: Dict[str, Any]
+      - run_card_path: str
+      - summary: str
+      - result: RunResult
+    """
+    ...
 
 def _ensure_defaults(state: State):
     state.setdefault("db_path", "taw.db")
@@ -39,85 +59,94 @@ def _estimate_stiffness(csv_path: str) -> float:
     a, _ = np.polyfit(x, y, deg=1)
     return float(max(a, 0.0))
 
-def planner(state: State) -> State:
+def _first_existing(p: str | None) -> str | None:
+    return p if p and Path(p).exists() else None
+
+# -----------------------
+# Node 1: DecisionAgent
+# -----------------------
+def decision_node(state: State) -> State:
+    """
+    - Ensure defaults/spec
+    - Open datastore task (task_id)
+    - Record tooling mode
+    - (Optional) RAG retrieve citations (kept minimal & fast)
+    """
     _ensure_defaults(state)
     spec = _ensure_spec(state)
     tools = get_tools(db_path=state["db_path"], artifacts_dir=state["artifacts_dir"])
 
-    # make sure task exists
+    # Create task if needed
     if "task_id" not in state:
-        state["task_id"] = tools.ds_new_task(prompt=spec.prompt, objective=spec.objective, params=spec.params)
-
-    # record tooling mode so we can see it in Studio
-    state["tooling_mode"] = getattr(tools, "mode", "unknown")
-    tools.ds_log_run(state["task_id"], "tooling", "tooling.mode",
-                     {"db_path": state["db_path"], "artifacts_dir": state["artifacts_dir"]},
-                     {"mode": state["tooling_mode"]})
-
-    # LLM plan with fallback
-    llm_steps = plan_with_llm(spec.objective, spec.params)
-    if isinstance(llm_steps, list) and llm_steps:
-        steps = [PlanStep(name=s.get("name","step"), tool=s.get("tool",""), inputs=s.get("inputs",{})) for s in llm_steps]
-        plan = AgentPlan(steps=steps)
-        tools.ds_log_run(state["task_id"], "plan", "planner.llm",
-                         {"objective": spec.objective}, {"steps": [s.dict() for s in plan.steps]})
-    else:
-        plan = AgentPlan(steps=[
-            PlanStep(name="retrieve", tool="rag.retrieve", inputs={"q": spec.objective, "k": 3}),
-            PlanStep(name="fill", tool="templates.fill", inputs={"name": "vertical_stiffness.j2", "params": spec.params}),
-            PlanStep(name="run", tool="fem.run", inputs={}),
-            PlanStep(name="plot", tool="plots.plot", inputs={}),
-            PlanStep(name="summarize", tool="summarize", inputs={}),
-            PlanStep(name="validate", tool="validate", inputs={}),
-        ])
-        tools.ds_log_run(state["task_id"], "plan", "planner.fixed",
-                         {"objective": spec.objective}, {"steps": [s.dict() for s in plan.steps]})
-    state["plan"] = plan
-    return state
-
-def executor(state: State) -> State:
-    _ensure_defaults(state)
-    spec: TaskSpec = _ensure_spec(state)
-    tools = get_tools(db_path=state["db_path"], artifacts_dir=state["artifacts_dir"])
-    if "task_id" not in state:
-        state["task_id"] = tools.ds_new_task(prompt=spec.prompt, objective=spec.objective, params=spec.params)
+        state["task_id"] = tools.ds_new_task(
+            prompt=spec.prompt, objective=spec.objective, params=spec.params
+        )
     tid = state["task_id"]
 
-    # 1) RAG
-    hits = tools.rag_retrieve(spec.objective, k=3, method="hybrid_v2")
+    # Log tooling mode for visibility in Studio
+    state["tooling_mode"] = getattr(tools, "mode", "unknown")
+    tools.ds_log_run(
+        tid, "tooling", "tooling.mode",
+        {"db_path": state["db_path"], "artifacts_dir": state["artifacts_dir"]},
+        {"mode": state["tooling_mode"]}
+    )
 
-# Normalize just in case (safety belt)
-    import json as _json
-    if isinstance(hits, str):
-        try:
-            hits = _json.loads(hits)
-        except Exception:
-            hits = []
-    if isinstance(hits, dict):
-        hits = hits.get("items") or hits.get("data") or [hits]
-    hits = [h for h in hits if isinstance(h, dict)]
+    # Very light RAG (optional; safe-guarded)
+    try:
+        hits = tools.rag_retrieve(spec.objective, k=3, method="hybrid_v2")
+        if isinstance(hits, dict):
+            hits = hits.get("items") or hits.get("data") or [hits]
+        hits = [h for h in hits if isinstance(h, dict)]
+        citations = [h.get("source_id", "") for h in hits if "source_id" in h]
+    except Exception:
+        citations = []
+    state["citations"] = citations
+    tools.ds_log_run(tid, "retrieve", "rag.retrieve",
+                     {"q": spec.objective, "k": 3}, {"citations": citations})
+    return state
 
-    citations = [h.get("source_id", "") for h in hits if "source_id" in h]
-    tools.ds_log_run(tid, "retrieve", "rag.retrieve", {"q": spec.objective, "k": 3}, {"citations": citations})
+# -----------------------
+# Node 2: TemplateAgent
+# -----------------------
+def template_node(state: State) -> State:
+    """
+    - Fill the Jinja deck template
+    """
+    _ensure_defaults(state)
+    spec = _ensure_spec(state)
+    tools = get_tools(db_path=state["db_path"], artifacts_dir=state["artifacts_dir"])
+    tid = state["task_id"]
 
-    # 2) Fill template
-    deck = tools.templates_fill("vertical_stiffness.j2", spec.params)
-    tools.ds_log_run(tid, "fill", "templates.fill", {"template": "vertical_stiffness.j2", "params": spec.params}, {"deck_len": len(deck)})
+    template_name = "vertical_stiffness.j2"  # keep explicit
+    deck_text = tools.templates_fill(template_name, spec.params)
+    state["deck_text"] = deck_text
 
-    # 3) FEM (mock)
-    run_out = tools.fem_run(deck)
+    tools.ds_log_run(
+        tid, "fill", "templates.fill",
+        {"template": template_name, "params": spec.params},
+        {"deck_len": len(deck_text)}
+    )
+    return state
 
-    # Defensive normalization
-    def _first_existing(path: str | None) -> str | None:
-        from pathlib import Path
-        return path if path and Path(path).exists() else None
+# -----------------------
+# Node 3: FEMAgent
+# -----------------------
+def fem_node(state: State) -> State:
+    """
+    - Run mock FEM
+    - Normalize artifact paths (csv/log/deck)
+    """
+    _ensure_defaults(state)
+    tools = get_tools(db_path=state["db_path"], artifacts_dir=state["artifacts_dir"])
+    tid = state["task_id"]
+
+    run_out = tools.fem_run(state["deck_text"])
 
     csv_path = _first_existing(run_out.get("csv"))
     log_path = _first_existing(run_out.get("log"))
     deck_path = _first_existing(run_out.get("deck"))
 
-# If missing, try to discover the most recent artifacts in artifacts_dir
-    from pathlib import Path
+    # Fallback discovery in artifacts dir (defensive)
     artdir = Path(state["artifacts_dir"])
     if not csv_path:
         cands = sorted(artdir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -126,36 +155,67 @@ def executor(state: State) -> State:
         cands = sorted(artdir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
         log_path = cands[0].as_posix() if cands else None
     if not deck_path:
-        cands = sorted(list(artdir.glob("*.inp")) + list(artdir.glob("*.txt")), key=lambda p: p.stat().st_mtime, reverse=True)
+        cands = sorted(list(artdir.glob("*.inp")) + list(artdir.glob("*.txt")),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
         deck_path = cands[0].as_posix() if cands else None
 
     if not (csv_path and log_path and deck_path):
-    # Log + fail early with a helpful message
-        tools.ds_log_run(tid, "run", "fem.run_mock", {"note": "fem outputs missing", "raw": run_out}, {"ok": False}, status="error")
+        tools.ds_log_run(
+            tid, "run", "fem.run_mock",
+            {"note": "fem outputs missing", "raw": run_out}, {"ok": False}, status="error"
+        )
         raise RuntimeError(f"fem.run did not yield expected artifacts (got {run_out}).")
 
-    tools.ds_log_run(tid, "run", "fem.run_mock", {"deck_path": deck_path}, {"csv": csv_path, "log": log_path})
+    state["fem_csv"] = csv_path
+    state["fem_log"] = log_path
+    state["fem_deck"] = deck_path
 
-    # 4) Plot
-    png_path = tools.plots_plot_curve(csv_path, filename="curve.png")["png"]
-    tools.ds_log_run(tid, "plot", "plots.plot_curve", {"csv": csv_path}, {"png": png_path})
+    tools.ds_log_run(
+        tid, "run", "fem.run_mock",
+        {"deck_path": deck_path},
+        {"csv": csv_path, "log": log_path}
+    )
+    return state
 
-    # 5) Metrics
-    k_est = _estimate_stiffness(csv_path)
+# -----------------------
+# Node 4: PostProcessAgent
+# -----------------------
+def postprocess_node(state: State) -> State:
+    """
+    - Plot curve
+    - Compute metrics
+    - LLM summary
+    - Validate + write Run Card
+    - Build RunResult
+    """
+    _ensure_defaults(state)
+    spec: TaskSpec = _ensure_spec(state)
+    tools = get_tools(db_path=state["db_path"], artifacts_dir=state["artifacts_dir"])
+    tid = state["task_id"]
+
+    # Plot
+    png_path = tools.plots_plot_curve(state["fem_csv"], filename="curve.png")["png"]
+    state["plot_png"] = png_path
+    tools.ds_log_run(tid, "plot", "plots.plot_curve", {"csv": state["fem_csv"]}, {"png": png_path})
+
+    # Metrics
+    k_est = _estimate_stiffness(state["fem_csv"])
     metrics = {"stiffness_est_N_per_m": k_est}
-    tools.ds_log_run(tid, "summarize", "metrics.estimate", {"csv": csv_path}, {"metrics": metrics})
+    state["metrics"] = metrics
+    tools.ds_log_run(tid, "summarize", "metrics.estimate", {"csv": state["fem_csv"]}, {"metrics": metrics})
 
-    # 5b) LLM summary
+    # Summary with citations (lightweight LLM)
+    citations = state.get("citations", [])
     summary = summarize_with_citations(spec.objective, citations, metrics)
+    state["summary"] = summary
 
-    # 6) Validate + Run Card
+    # Validate + Run Card
     artifacts = [
-        {"path": deck_path, "kind": "deck"},
-        {"path": log_path, "kind": "log"},
-        {"path": csv_path, "kind": "csv"},
-        {"path": png_path, "kind": "plot"},
+        {"path": state["fem_deck"], "kind": "deck"},
+        {"path": state["fem_log"],  "kind": "log"},
+        {"path": state["fem_csv"],  "kind": "csv"},
+        {"path": state["plot_png"], "kind": "plot"},
     ]
-    from validation.run_card import validate_and_write_run_card
     validation, run_card_path = validate_and_write_run_card(
         task_id=tid,
         artifacts_dir=state["artifacts_dir"],
@@ -167,11 +227,16 @@ def executor(state: State) -> State:
         artifacts=artifacts,
         summary=summary
     )
-    tools.ds_log_run(tid, "validate", "validation.run_card",
-                     {"csv": csv_path, "citations": citations},
-                     {"status": validation.status, "run_card": run_card_path, "fail_reasons": validation.fail_reasons})
+    state["run_card_path"] = run_card_path
 
-    state["result"] = RunResult(
+    tools.ds_log_run(
+        tid, "validate", "validation.run_card",
+        {"csv": state["fem_csv"], "citations": citations},
+        {"status": validation.status, "run_card": run_card_path, "fail_reasons": validation.fail_reasons}
+    )
+
+    # Final result object (what /plan-run expects)
+    result = RunResult(
         metrics=metrics,
         artifacts=[RunArtifact(**a) for a in artifacts],
         citations=citations,
@@ -187,15 +252,24 @@ def executor(state: State) -> State:
         summary=summary,
         tooling_mode=state.get("tooling_mode", "unknown"),
     )
+    state["result"] = result
     return state
 
+# -----------------------
+# Build the 4-node graph
+# -----------------------
 def build_graph():
     g = StateGraph(State)
-    g.add_node("planner", planner)
-    g.add_node("executor", executor)
-    g.set_entry_point("planner")
-    g.add_edge("planner", "executor")
-    g.add_edge("executor", END)
+    g.add_node("DecisionAgent", decision_node)
+    g.add_node("TemplateAgent", template_node)
+    g.add_node("FEMAgent", fem_node)
+    g.add_node("PostProcessAgent", postprocess_node)
+
+    g.set_entry_point("DecisionAgent")
+    g.add_edge("DecisionAgent", "TemplateAgent")
+    g.add_edge("TemplateAgent", "FEMAgent")
+    g.add_edge("FEMAgent", "PostProcessAgent")
+    g.add_edge("PostProcessAgent", END)
     return g.compile()
 
 graph = build_graph()

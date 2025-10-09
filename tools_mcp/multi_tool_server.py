@@ -2,26 +2,30 @@
 from __future__ import annotations
 from typing import Any
 import os
+import sys, pathlib
+
+# --- Put this at the very top, BEFORE importing local packages ---
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from mcp.server.fastmcp import FastMCP
 
-# Reuse your existing local modules
+# Reuse your existing local modules (now safe)
 from tools import templates as templates_local
 from tools import fem_mock as fem_local
 from tools import plots as plots_local
 from tools.datastore import Store
 from rag.retriever import retrieve as rag_local
-import sys, pathlib
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-
+SCHEMA_PATH = ROOT / "datastore" / "schema.sql"
 
 def _store(db_path: str, artifacts_dir: str) -> Store:
     s = Store(db_path=db_path, artifacts_dir=artifacts_dir)
-    s.init("datastore/schema.sql")
+    # Use absolute path so CWD doesn't matter
+    s.init(str(SCHEMA_PATH))
     s.ensure_artifacts_dir()
     return s
-
 
 # One multi-tool MCP server
 mcp = FastMCP(
@@ -101,5 +105,6 @@ def ds_write_metric(db_path: str, artifacts_dir: str, task_id: int, name: str, v
     return {"metric_id": int(metric_id)}
 
 if __name__ == "__main__":
-    # Default transport is stdio; perfect for Studio launching a child process.
+    # Print to STDERR so we don't interfere with stdio transport
+    print("Starting MCP server 'taw-tools' (stdio)…", file=sys.stderr, flush=True)
     mcp.run()
