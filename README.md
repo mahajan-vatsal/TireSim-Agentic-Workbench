@@ -57,8 +57,10 @@ The figure below is a typical output from a vertical stiffness sweep. It shows t
 
 <img width="876" height="678" alt="curve" src="https://github.com/user-attachments/assets/f6942faa-15c9-40aa-a88b-4ca63ace65d6" />
 
+
 Below is the Run Card image summarising the objective, parameters, citations, metrics, artifacts and validation status in Markdown.
-<img width="651" height="797" alt="run card" src="https://github.com/user-attachments/assets/e207129f-c71a-404a-b3c1-76db077f6ad7" />
+<img width="651" height="774" alt="run card" src="https://github.com/user-attachments/assets/fb5217ed-d26b-449e-b8e3-cf37a98bf1d3" />
+
 
 
 
