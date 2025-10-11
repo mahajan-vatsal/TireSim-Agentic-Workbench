@@ -1,15 +1,16 @@
 # taw/agents/graph.py
 from __future__ import annotations
 from typing import Dict, Any, List
+import json
 import pandas as pd, numpy as np
 from pathlib import Path
 
 from langgraph.graph import StateGraph, END
 
-from agents.models import TaskSpec, AgentPlan, PlanStep, RunResult, RunArtifact
+from agents.models import TaskSpec, RunResult, RunArtifact
 from agents.mcp_tools import get_tools
+from agents.nodes.llm import summarize_with_citations
 from validation.run_card import validate_and_write_run_card
-from agents.nodes.llm import plan_with_llm, summarize_with_citations
 
 # -----------------------
 # State & helpers
@@ -31,9 +32,11 @@ class State(dict):
     """
     ...
 
-def _ensure_defaults(state: State):
-    state.setdefault("db_path", "taw.db")
-    state.setdefault("artifacts_dir", "artifacts")
+def _ensure_defaults(state: State) -> Dict[str, str]:
+    return {
+        "db_path": state.get("db_path", "taw.db"),
+        "artifacts_dir": state.get("artifacts_dir", "artifacts"),
+    }
 
 def _ensure_spec(state: State) -> TaskSpec:
     if isinstance(state.get("spec"), TaskSpec):
@@ -47,11 +50,11 @@ def _ensure_spec(state: State) -> TaskSpec:
         "mesh_mm": 8.0,
         "load_sweep": [0, 10000, 20000, 30000, 40000, 50000],
     }
-    spec = TaskSpec(prompt=prompt, objective=objective, params=params)
-    state["spec"] = spec
-    return spec
+    return TaskSpec(prompt=prompt, objective=objective, params=params)
 
-def _estimate_stiffness(csv_path: str) -> float:
+def _estimate_stiffness(csv_path: str | None) -> float:
+    if not csv_path or not Path(csv_path).exists():
+        return 0.0
     df = pd.read_csv(csv_path)
     if len(df) < 2:
         return 0.0
@@ -62,36 +65,72 @@ def _estimate_stiffness(csv_path: str) -> float:
 def _first_existing(p: str | None) -> str | None:
     return p if p and Path(p).exists() else None
 
+def _to_dict(obj: Any) -> Dict[str, Any]:
+    """Normalize tool return shapes to dict."""
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        for k in ("value", "data", "result"):
+            v = obj.get(k)
+            if isinstance(v, dict):
+                return v
+        return obj
+    if isinstance(obj, str):
+        try:
+            dec = json.loads(obj)
+            return dec if isinstance(dec, dict) else {}
+        except Exception:
+            if obj.endswith(".png"):
+                return {"png": obj}
+            return {}
+    if isinstance(obj, list) and obj:
+        it = obj[0]
+        if isinstance(it, dict):
+            return it
+        if isinstance(it, str):
+            try:
+                dec = json.loads(it)
+                return dec if isinstance(dec, dict) else {}
+            except Exception:
+                if it.endswith(".png"):
+                    return {"png": it}
+                return {}
+    return {}
+
+def _latest_by_suffix(dir_path: str, suffix: str, prefer_name: str | None = None) -> str | None:
+    p = Path(dir_path)
+    if not p.exists():
+        return None
+    files = list(p.glob(f"*{suffix}"))
+    if not files:
+        return None
+    if prefer_name:
+        preferred = [f for f in files if f.name == prefer_name]
+        if preferred:
+            return preferred[0].as_posix()
+    files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return files[0].as_posix()
+
 # -----------------------
 # Node 1: DecisionAgent
 # -----------------------
-def decision_node(state: State) -> State:
-    """
-    - Ensure defaults/spec
-    - Open datastore task (task_id)
-    - Record tooling mode
-    - (Optional) RAG retrieve citations (kept minimal & fast)
-    """
-    _ensure_defaults(state)
+def decision_node(state: State) -> Dict[str, Any]:
+    defaults = _ensure_defaults(state)
     spec = _ensure_spec(state)
-    tools = get_tools(db_path=state["db_path"], artifacts_dir=state["artifacts_dir"])
+    tools = get_tools(db_path=defaults["db_path"], artifacts_dir=defaults["artifacts_dir"])
 
-    # Create task if needed
-    if "task_id" not in state:
-        state["task_id"] = tools.ds_new_task(
-            prompt=spec.prompt, objective=spec.objective, params=spec.params
-        )
-    tid = state["task_id"]
-
-    # Log tooling mode for visibility in Studio
-    state["tooling_mode"] = getattr(tools, "mode", "unknown")
-    tools.ds_log_run(
-        tid, "tooling", "tooling.mode",
-        {"db_path": state["db_path"], "artifacts_dir": state["artifacts_dir"]},
-        {"mode": state["tooling_mode"]}
+    task_id = state.get("task_id") or tools.ds_new_task(
+        prompt=spec.prompt, objective=spec.objective, params=spec.params
     )
 
-    # Very light RAG (optional; safe-guarded)
+    tooling_mode = getattr(tools, "mode", "unknown")
+    tools.ds_log_run(
+        task_id, "tooling", "tooling.mode",
+        {"db_path": defaults["db_path"], "artifacts_dir": defaults["artifacts_dir"]},
+        {"mode": tooling_mode}
+    )
+
+    citations: List[str] = []
     try:
         hits = tools.rag_retrieve(spec.objective, k=3, method="hybrid_v2")
         if isinstance(hits, dict):
@@ -100,54 +139,58 @@ def decision_node(state: State) -> State:
         citations = [h.get("source_id", "") for h in hits if "source_id" in h]
     except Exception:
         citations = []
-    state["citations"] = citations
-    tools.ds_log_run(tid, "retrieve", "rag.retrieve",
+    tools.ds_log_run(task_id, "retrieve", "rag.retrieve",
                      {"q": spec.objective, "k": 3}, {"citations": citations})
-    return state
+
+    return {
+        "db_path": defaults["db_path"],
+        "artifacts_dir": defaults["artifacts_dir"],
+        "spec": spec,
+        "task_id": task_id,
+        "tooling_mode": tooling_mode,
+        "citations": citations,
+    }
 
 # -----------------------
 # Node 2: TemplateAgent
 # -----------------------
-def template_node(state: State) -> State:
-    """
-    - Fill the Jinja deck template
-    """
-    _ensure_defaults(state)
-    spec = _ensure_spec(state)
-    tools = get_tools(db_path=state["db_path"], artifacts_dir=state["artifacts_dir"])
-    tid = state["task_id"]
+def template_node(state: State) -> Dict[str, Any]:
+    defaults = _ensure_defaults(state)
+    spec: TaskSpec = _ensure_spec(state)
+    tools = get_tools(db_path=defaults["db_path"], artifacts_dir=defaults["artifacts_dir"])
+    task_id = state.get("task_id") or tools.ds_new_task(
+        prompt=spec.prompt, objective=spec.objective, params=spec.params
+    )
 
-    template_name = "vertical_stiffness.j2"  # keep explicit
+    template_name = "vertical_stiffness.j2"
     deck_text = tools.templates_fill(template_name, spec.params)
-    state["deck_text"] = deck_text
 
     tools.ds_log_run(
-        tid, "fill", "templates.fill",
+        task_id, "fill", "templates.fill",
         {"template": template_name, "params": spec.params},
         {"deck_len": len(deck_text)}
     )
-    return state
+    return {
+        "task_id": task_id,
+        "deck_text": deck_text,
+    }
 
 # -----------------------
 # Node 3: FEMAgent
 # -----------------------
-def fem_node(state: State) -> State:
-    """
-    - Run mock FEM
-    - Normalize artifact paths (csv/log/deck)
-    """
-    _ensure_defaults(state)
-    tools = get_tools(db_path=state["db_path"], artifacts_dir=state["artifacts_dir"])
-    tid = state["task_id"]
+def fem_node(state: State) -> Dict[str, Any]:
+    defaults = _ensure_defaults(state)
+    tools = get_tools(db_path=defaults["db_path"], artifacts_dir=defaults["artifacts_dir"])
+    task_id = state.get("task_id") or 0
+    deck_text = state.get("deck_text") or ""
 
-    run_out = tools.fem_run(state["deck_text"])
+    run_out = tools.fem_run(deck_text)
 
     csv_path = _first_existing(run_out.get("csv"))
     log_path = _first_existing(run_out.get("log"))
     deck_path = _first_existing(run_out.get("deck"))
 
-    # Fallback discovery in artifacts dir (defensive)
-    artdir = Path(state["artifacts_dir"])
+    artdir = Path(defaults["artifacts_dir"])
     if not csv_path:
         cands = sorted(artdir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
         csv_path = cands[0].as_posix() if cands else None
@@ -161,64 +204,84 @@ def fem_node(state: State) -> State:
 
     if not (csv_path and log_path and deck_path):
         tools.ds_log_run(
-            tid, "run", "fem.run_mock",
+            task_id, "run", "fem.run_mock",
             {"note": "fem outputs missing", "raw": run_out}, {"ok": False}, status="error"
         )
         raise RuntimeError(f"fem.run did not yield expected artifacts (got {run_out}).")
 
-    state["fem_csv"] = csv_path
-    state["fem_log"] = log_path
-    state["fem_deck"] = deck_path
-
     tools.ds_log_run(
-        tid, "run", "fem.run_mock",
+        task_id, "run", "fem.run_mock",
         {"deck_path": deck_path},
         {"csv": csv_path, "log": log_path}
     )
-    return state
+    return {
+        "task_id": task_id,
+        "fem_csv": csv_path,
+        "fem_log": log_path,
+        "fem_deck": deck_path,
+    }
 
 # -----------------------
 # Node 4: PostProcessAgent
 # -----------------------
-def postprocess_node(state: State) -> State:
-    """
-    - Plot curve
-    - Compute metrics
-    - LLM summary
-    - Validate + write Run Card
-    - Build RunResult
-    """
-    _ensure_defaults(state)
+def postprocess_node(state: State) -> Dict[str, Any]:
+    defaults = _ensure_defaults(state)
     spec: TaskSpec = _ensure_spec(state)
-    tools = get_tools(db_path=state["db_path"], artifacts_dir=state["artifacts_dir"])
-    tid = state["task_id"]
+    tools = get_tools(db_path=defaults["db_path"], artifacts_dir=defaults["artifacts_dir"])
 
-    # Plot
-    png_path = tools.plots_plot_curve(state["fem_csv"], filename="curve.png")["png"]
-    state["plot_png"] = png_path
-    tools.ds_log_run(tid, "plot", "plots.plot_curve", {"csv": state["fem_csv"]}, {"png": png_path})
-
-    # Metrics
-    k_est = _estimate_stiffness(state["fem_csv"])
-    metrics = {"stiffness_est_N_per_m": k_est}
-    state["metrics"] = metrics
-    tools.ds_log_run(tid, "summarize", "metrics.estimate", {"csv": state["fem_csv"]}, {"metrics": metrics})
-
-    # Summary with citations (lightweight LLM)
+    task_id = state.get("task_id") or 0
+    fem_csv = state.get("fem_csv")
+    fem_log = state.get("fem_log")
+    fem_deck = state.get("fem_deck")
     citations = state.get("citations", [])
+
+    # If fem_csv is missing (e.g., node ran out of order in Studio), try to discover it again.
+    if not fem_csv or not Path(fem_csv).exists():
+        fem_csv = _latest_by_suffix(defaults["artifacts_dir"], ".csv")
+    if not fem_csv or not Path(fem_csv).exists():
+        tools.ds_log_run(
+            task_id, "plot", "plots.plot_curve",
+            {"note": "CSV missing before plot/metrics"}, {"ok": False}, status="error"
+        )
+        raise RuntimeError("No FEM CSV found to post-process. Ensure FEMAgent ran and produced a CSV in artifacts/.")
+
+    # Plot (robust to varying return shapes)
+    raw_plot = tools.plots_plot_curve(fem_csv, filename="curve.png")
+    plot_dict = _to_dict(raw_plot)
+    png_path = plot_dict.get("png")
+    if not png_path or not Path(png_path).exists():
+        png_path = _latest_by_suffix(defaults["artifacts_dir"], ".png", prefer_name="curve.png") \
+                   or _latest_by_suffix(defaults["artifacts_dir"], ".png")
+    if not png_path or not Path(png_path).exists():
+        tools.ds_log_run(
+            task_id, "plot", "plots.plot_curve",
+            {"csv": fem_csv, "note": "png missing", "raw": raw_plot},
+            {"ok": False}, status="error"
+        )
+        raise RuntimeError(f"plots.plot_curve did not yield a PNG (got {raw_plot}).")
+
+    tools.ds_log_run(task_id, "plot", "plots.plot_curve", {"csv": fem_csv}, {"png": png_path})
+
+    # Metrics (now safe)
+    k_est = _estimate_stiffness(fem_csv)
+    metrics = {"stiffness_est_N_per_m": k_est}
+    tools.ds_log_run(task_id, "summarize", "metrics.estimate", {"csv": fem_csv}, {"metrics": metrics})
+
+    # Summary with citations (LLM)
     summary = summarize_with_citations(spec.objective, citations, metrics)
-    state["summary"] = summary
 
     # Validate + Run Card
     artifacts = [
-        {"path": state["fem_deck"], "kind": "deck"},
-        {"path": state["fem_log"],  "kind": "log"},
-        {"path": state["fem_csv"],  "kind": "csv"},
-        {"path": state["plot_png"], "kind": "plot"},
+        {"path": fem_deck, "kind": "deck"} if fem_deck else None,
+        {"path": fem_log,  "kind": "log"}  if fem_log  else None,
+        {"path": fem_csv,  "kind": "csv"},
+        {"path": png_path, "kind": "plot"},
     ]
+    artifacts = [a for a in artifacts if a and a.get("path")]
+
     validation, run_card_path = validate_and_write_run_card(
-        task_id=tid,
-        artifacts_dir=state["artifacts_dir"],
+        task_id=task_id,
+        artifacts_dir=defaults["artifacts_dir"],
         prompt=spec.prompt,
         objective=spec.objective,
         params=spec.params,
@@ -227,20 +290,18 @@ def postprocess_node(state: State) -> State:
         artifacts=artifacts,
         summary=summary
     )
-    state["run_card_path"] = run_card_path
 
     tools.ds_log_run(
-        tid, "validate", "validation.run_card",
-        {"csv": state["fem_csv"], "citations": citations},
+        task_id, "validate", "validation.run_card",
+        {"csv": fem_csv, "citations": citations},
         {"status": validation.status, "run_card": run_card_path, "fail_reasons": validation.fail_reasons}
     )
 
-    # Final result object (what /plan-run expects)
     result = RunResult(
         metrics=metrics,
         artifacts=[RunArtifact(**a) for a in artifacts],
         citations=citations,
-        task_id=tid,
+        task_id=task_id,
         validation={
             "status": validation.status,
             "loads_strictly_increasing": validation.loads_strictly_increasing,
@@ -252,8 +313,15 @@ def postprocess_node(state: State) -> State:
         summary=summary,
         tooling_mode=state.get("tooling_mode", "unknown"),
     )
-    state["result"] = result
-    return state
+
+    return {
+        "task_id": task_id,
+        "plot_png": png_path,
+        "metrics": metrics,
+        "run_card_path": run_card_path,
+        "summary": summary,
+        "result": result,
+    }
 
 # -----------------------
 # Build the 4-node graph
