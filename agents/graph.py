@@ -180,8 +180,19 @@ def template_node(state: State) -> Dict[str, Any]:
 # -----------------------
 def fem_node(state: State) -> Dict[str, Any]:
     defaults = _ensure_defaults(state)
-    tools = get_tools(db_path=defaults["db_path"], artifacts_dir=defaults["artifacts_dir"])
-    task_id = state.get("task_id") or 0
+    spec: TaskSpec = _ensure_spec(state)
+    tools = get_tools(db_path=defaults["db_path"], 
+                      artifacts_dir=defaults["artifacts_dir"])
+    # Ensure we have a valid task ID.  If DecisionAgent hasn't run, lazily
+    # create a new task using the current specification instead of
+    # defaulting to zero.
+    task_id = state.get("task_id")
+    if task_id is None:
+        task_id = tools.ds_new_task(
+            prompt=spec.prompt,
+            objective=spec.objective,
+            params=spec.params,
+        )
     deck_text = state.get("deck_text") or ""
 
     run_out = tools.fem_run(deck_text)
@@ -229,7 +240,13 @@ def postprocess_node(state: State) -> Dict[str, Any]:
     spec: TaskSpec = _ensure_spec(state)
     tools = get_tools(db_path=defaults["db_path"], artifacts_dir=defaults["artifacts_dir"])
 
-    task_id = state.get("task_id") or 0
+    task_id = state.get("task_id")
+    if task_id is None:
+        task_id = tools.ds_new_task(
+            prompt=spec.prompt,
+            objective=spec.objective,
+            params=spec.params,
+        )
     fem_csv = state.get("fem_csv")
     fem_log = state.get("fem_log")
     fem_deck = state.get("fem_deck")
